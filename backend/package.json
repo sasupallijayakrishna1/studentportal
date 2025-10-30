@@ -9,12 +9,12 @@
   },
   "dependencies": {
     "express": "^4.18.2",
+    "gridfs-stream": "^1.1.1",
     "mongoose": "^7.5.0",
-    "multer": "^2.0.2"
+    "multer": "^2.0.2",
+    "multer-gridfs-storage": "^5.0.2"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
   }
 }
-
-
