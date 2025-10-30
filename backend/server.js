@@ -1,26 +1,60 @@
+/**
+ * server.js
+ *
+ * Original file preserved with minimal, targeted changes:
+ * - Replace local disk multer storage with multer-gridfs-storage (GridFS) to store files permanently in MongoDB Atlas.
+ * - Keep original Material/Question/Update fields (fileName, originalFileName, filePath, fileSize, fileType)
+ *   for frontend compatibility. For GridFS stored files we set:
+ *     - fileName => GridFS filename
+ *     - originalFileName => original uploaded name
+ *     - filePath => null (kept but not used for GridFS)
+ *     - fileId => ObjectId of GridFS file (new field, optional)
+ * - View & Download endpoints stream from GridFS when fileId exists; fall back to filesystem only if an actual valid filePath exists.
+ *
+ * Notes:
+ * 1. Install dependencies before running:
+ *    npm install multer-gridfs-storage gridfs-stream --legacy-peer-deps
+ *
+ * 2. This keeps all routes and behavior same as your original app; only upload/storage logic changed.
+ */
+
 const express = require('express');
 const mongoose = require('mongoose');
 const path = require('path');
 const multer = require('multer');
 const fs = require('fs');
+const { GridFsStorage } = require('multer-gridfs-storage');
+const { ObjectId } = require('mongodb');
+
 const app = express();
 
+// -------------------------
 // MongoDB Connection
-mongoose.connect('mongodb+srv://sasupallijayakrishna_db_user:StudentPortal@clustergist.5tnp2tf.mongodb.net/?appName=ClusterGist', {
+// -------------------------
+const mongoURI = 'mongodb+srv://sasupallijayakrishna_db_user:StudentPortal@clustergist.5tnp2tf.mongodb.net/?appName=ClusterGist';
+
+mongoose.connect(mongoURI, {
     useNewUrlParser: true,
     useUnifiedTopology: true
 });
 
-// Check MongoDB connection
-mongoose.connection.on('connected', () => {
+const conn = mongoose.connection;
+let gfsBucket = null;
+
+conn.once('open', () => {
     console.log('✅ MongoDB connected successfully');
+    // Initialize GridFS Bucket named 'uploads'
+    gfsBucket = new mongoose.mongo.GridFSBucket(conn.db, { bucketName: 'uploads' });
+    console.log('✅ GridFS bucket initialized (uploads)');
 });
 
 mongoose.connection.on('error', (err) => {
     console.log('❌ MongoDB connection error:', err);
 });
 
-// Middleware
+// -------------------------
+// Middleware & Static
+// -------------------------
 app.use(express.json());
 app.use(express.static('frontend'));
 
@@ -29,43 +63,42 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, '../frontend/index.html'));
 });
 
-// // Middleware
-// app.use(express.json());
-// app.use(express.static(path.join(__dirname, 'frontend')));
-
-// // Serve the HTML file
-// app.get('/', (req, res) => {
-//     res.sendFile(path.join(__dirname, 'frontend','index.html'));
-// });
-
-// Create uploads directory if it doesn't exist
+// -------------------------
+// Local uploads directory (kept for backward compatibility only)
+// -------------------------
 const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) {
     fs.mkdirSync(uploadsDir, { recursive: true });
 }
-
-// Serve uploads directory
 app.use('/uploads', express.static(uploadsDir));
 
-// Multer setup for handling file uploads
-const storage = multer.diskStorage({
-    destination: function (req, file, cb) {
-        cb(null, uploadsDir);
-    },
-    filename: function (req, file, cb) {
-        // Create unique filename
-        const uniqueName = Date.now() + '-' + Math.round(Math.random() * 1E9) + path.extname(file.originalname);
-        cb(null, uniqueName);
+// -------------------------
+// Multer-GridFS Storage Setup
+// -------------------------
+// We use multer-gridfs-storage so uploaded files go to GridFS in Atlas.
+const storage = new GridFsStorage({
+    url: mongoURI,
+    options: { useUnifiedTopology: true },
+    file: (req, file) => {
+        const filename = `${Date.now()}-${Math.round(Math.random() * 1E9)}-${file.originalname}`;
+        return {
+            filename,
+            bucketName: 'uploads',
+            metadata: {
+                originalname: file.originalname,
+                uploadedBy: req.body.createdBy || 'unknown',
+                purpose: req.baseUrl || 'student_portal_upload'
+            }
+        };
     }
 });
 
 const upload = multer({
-    storage: storage,
+    storage,
     limits: {
-        fileSize: 50 * 1024 * 1024 // 50MB limit
+        fileSize: 50 * 1024 * 1024 // 50MB limit (same as original)
     },
     fileFilter: function (req, file, cb) {
-        // Allow all file types for educational content
         const allowedTypes = /\.(pdf|doc|docx|ppt|pptx|xls|xlsx|txt|jpg|jpeg|png|gif|mp4|mp3|zip|rar)$/i;
         if (allowedTypes.test(file.originalname)) {
             cb(null, true);
@@ -75,18 +108,9 @@ const upload = multer({
     }
 });
 
-// Health check endpoint
-app.get('/api/health', (req, res) => {
-    const dbStatus = mongoose.connection.readyState === 1 ? 'Connected' : 'Disconnected';
-    res.json({ 
-        status: 'Server running', 
-        database: dbStatus,
-        port: 3000,
-        timestamp: new Date().toISOString()
-    });
-});
-
+// -------------------------
 // Schemas
+// -------------------------
 const StudentSchema = new mongoose.Schema({
     name: String,
     userId: { type: String, unique: true },
@@ -115,16 +139,18 @@ const AdminSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now }
 });
 
+// NOTE: keep original fields for compatibility. Add fileId for GridFS reference.
 const MaterialSchema = new mongoose.Schema({
     title: String,
     description: String,
     year: String,
     department: String,
-    fileName: String,
-    originalFileName: String,
-    filePath: String,
+    fileName: String,          // GridFS filename or legacy local filename
+    originalFileName: String,  // original filename
+    filePath: String,          // path on disk (legacy; will be null for GridFS)
     fileSize: Number,
     fileType: String,
+    fileId: { type: mongoose.Schema.Types.ObjectId, required: false }, // GridFS file id
     createdBy: String,
     createdAt: { type: Date, default: Date.now }
 });
@@ -141,7 +167,9 @@ const AttendanceSchema = new mongoose.Schema({
     department: String
 });
 
+// -------------------------
 // Models
+// -------------------------
 const Student = mongoose.model('Student', StudentSchema);
 const Faculty = mongoose.model('Faculty', FacultySchema);
 const Admin = mongoose.model('Admin', AdminSchema);
@@ -150,12 +178,27 @@ const Question = mongoose.model('Question', MaterialSchema);
 const Update = mongoose.model('Update', MaterialSchema);
 const Attendance = mongoose.model('Attendance', AttendanceSchema);
 
+// -------------------------
+// Health check endpoint
+// -------------------------
+app.get('/api/health', (req, res) => {
+    const dbStatus = mongoose.connection.readyState === 1 ? 'Connected' : 'Disconnected';
+    res.json({
+        status: 'Server running',
+        database: dbStatus,
+        port: 3000,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// -------------------------
 // Authentication Routes
+// (unchanged logic)
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { userId, password, userType, year, department } = req.body;
         let user = null;
-        
+
         if (userType === 'student') {
             let query = { userId };
             if (year) query.year = year;
@@ -166,7 +209,7 @@ app.post('/api/auth/login', async (req, res) => {
         } else if (userType === 'admin') {
             user = await Admin.findOne({ userId });
         }
-        
+
         if (user && user.password === password) {
             res.json({ success: true, user: { ...user.toObject(), type: userType } });
         } else {
@@ -177,7 +220,9 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-// Student Routes
+// -------------------------
+// Student / Faculty / Admin CRUD (unchanged)
+// -------------------------
 app.post('/api/students', async (req, res) => {
     try {
         const student = new Student(req.body);
@@ -198,7 +243,7 @@ app.get('/api/students', async (req, res) => {
         let query = {};
         if (year) query.year = year;
         if (department) query.department = department;
-        
+
         const students = await Student.find(query);
         res.json({ success: true, data: students });
     } catch (error) {
@@ -212,7 +257,7 @@ app.post('/api/students/bulk', async (req, res) => {
         const results = [];
         const duplicates = [];
         let addedCount = 0;
-        
+
         for (const studentData of students) {
             try {
                 const student = new Student(studentData);
@@ -225,22 +270,21 @@ app.post('/api/students/bulk', async (req, res) => {
                 }
             }
         }
-        
+
         res.json({ success: true, addedCount, duplicates, data: results });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// Delete students by year and department
 app.delete('/api/students/delete', async (req, res) => {
     try {
         const { year, department } = req.query;
-        
+
         if (!year || !department) {
             return res.status(400).json({ success: false, message: 'Year and department are required' });
         }
-        
+
         const result = await Student.deleteMany({ year, department });
         res.json({ success: true, deletedCount: result.deletedCount });
     } catch (error) {
@@ -248,17 +292,16 @@ app.delete('/api/students/delete', async (req, res) => {
     }
 });
 
-// Delete individual student by ID
 app.delete('/api/students/delete/individual', async (req, res) => {
     try {
         const { userId } = req.query;
-        
+
         if (!userId) {
             return res.status(400).json({ success: false, message: 'User ID is required' });
         }
-        
+
         const result = await Student.deleteOne({ userId });
-        
+
         if (result.deletedCount > 0) {
             res.json({ success: true, deletedCount: result.deletedCount });
         } else {
@@ -269,7 +312,7 @@ app.delete('/api/students/delete/individual', async (req, res) => {
     }
 });
 
-// Faculty Routes
+// Faculty
 app.post('/api/faculty', async (req, res) => {
     try {
         const faculty = new Faculty(req.body);
@@ -299,7 +342,7 @@ app.post('/api/faculty/bulk', async (req, res) => {
         const results = [];
         const duplicates = [];
         let addedCount = 0;
-        
+
         for (const facultyData of faculty) {
             try {
                 const facultyMember = new Faculty(facultyData);
@@ -312,14 +355,13 @@ app.post('/api/faculty/bulk', async (req, res) => {
                 }
             }
         }
-        
+
         res.json({ success: true, addedCount, duplicates, data: results });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// FIXED: Separate endpoints for faculty and admin departments
 app.get('/api/faculty/departments', async (req, res) => {
     try {
         const faculty = await Faculty.find().distinct('department');
@@ -329,7 +371,6 @@ app.get('/api/faculty/departments', async (req, res) => {
     }
 });
 
-// FIXED: Get existing departments/roles for admins separately
 app.get('/api/admin/departments', async (req, res) => {
     try {
         const admins = await Admin.find();
@@ -342,15 +383,14 @@ app.get('/api/admin/departments', async (req, res) => {
     }
 });
 
-// Delete faculty by department
 app.delete('/api/faculty/delete', async (req, res) => {
     try {
         const { department } = req.query;
-        
+
         if (!department) {
             return res.status(400).json({ success: false, message: 'Department is required' });
         }
-        
+
         const result = await Faculty.deleteMany({ department });
         res.json({ success: true, deletedCount: result.deletedCount });
     } catch (error) {
@@ -358,17 +398,16 @@ app.delete('/api/faculty/delete', async (req, res) => {
     }
 });
 
-// Delete individual faculty by ID
 app.delete('/api/faculty/delete/individual', async (req, res) => {
     try {
         const { userId } = req.query;
-        
+
         if (!userId) {
             return res.status(400).json({ success: false, message: 'User ID is required' });
         }
-        
+
         const result = await Faculty.deleteOne({ userId });
-        
+
         if (result.deletedCount > 0) {
             res.json({ success: true, deletedCount: result.deletedCount });
         } else {
@@ -379,7 +418,7 @@ app.delete('/api/faculty/delete/individual', async (req, res) => {
     }
 });
 
-// Admin Routes
+// Admin
 app.post('/api/admin', async (req, res) => {
     try {
         const admin = new Admin(req.body);
@@ -409,7 +448,7 @@ app.post('/api/admin/bulk', async (req, res) => {
         const results = [];
         const duplicates = [];
         let addedCount = 0;
-        
+
         for (const adminData of admins) {
             try {
                 const admin = new Admin(adminData);
@@ -422,22 +461,21 @@ app.post('/api/admin/bulk', async (req, res) => {
                 }
             }
         }
-        
+
         res.json({ success: true, addedCount, duplicates, data: results });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// Delete admins by role
 app.delete('/api/admin/delete', async (req, res) => {
     try {
         const { role } = req.query;
-        
+
         if (!role) {
             return res.status(400).json({ success: false, message: 'Role is required' });
         }
-        
+
         const result = await Admin.deleteMany({ role });
         res.json({ success: true, deletedCount: result.deletedCount });
     } catch (error) {
@@ -445,17 +483,16 @@ app.delete('/api/admin/delete', async (req, res) => {
     }
 });
 
-// Delete individual admin by ID
 app.delete('/api/admin/delete/individual', async (req, res) => {
     try {
         const { userId } = req.query;
-        
+
         if (!userId) {
             return res.status(400).json({ success: false, message: 'User ID is required' });
         }
-        
+
         const result = await Admin.deleteOne({ userId });
-        
+
         if (result.deletedCount > 0) {
             res.json({ success: true, deletedCount: result.deletedCount });
         } else {
@@ -466,14 +503,24 @@ app.delete('/api/admin/delete/individual', async (req, res) => {
     }
 });
 
-// Material Routes
+// -------------------------
+// Material Routes (uploads now use GridFS)
+// -------------------------
 app.post('/api/materials/upload', upload.single('file'), async (req, res) => {
     try {
         const { title, description, year, department, createdBy } = req.body;
-        
+
         if (!req.file) {
             return res.status(400).json({ success: false, message: 'No file uploaded' });
         }
+
+        // multer-gridfs-storage provides file info in req.file
+        // file id property may be stored in req.file.id or req.file._id depending on version
+        const gridFileId = req.file.id || req.file._id || (req.file.fileId ? req.file.fileId : null);
+        const gridFilename = req.file.filename;
+        const originalFileName = (req.file.metadata && req.file.metadata.originalname) || req.file.originalname || req.file.originalName || req.file.filename;
+        const fileType = req.file.contentType || req.file.mimetype || 'application/octet-stream';
+        const fileSize = req.file.size || 0;
 
         const material = new Material({
             title,
@@ -481,11 +528,12 @@ app.post('/api/materials/upload', upload.single('file'), async (req, res) => {
             year,
             department,
             createdBy,
-            fileName: req.file.filename,
-            originalFileName: req.file.originalname,
-            filePath: req.file.path,
-            fileSize: req.file.size,
-            fileType: req.file.mimetype
+            fileName: gridFilename,
+            originalFileName,
+            filePath: null,   // no local path for GridFS
+            fileSize,
+            fileType,
+            fileId: gridFileId
         });
 
         await material.save();
@@ -495,6 +543,7 @@ app.post('/api/materials/upload', upload.single('file'), async (req, res) => {
     }
 });
 
+// keep POST /api/materials unchanged
 app.post('/api/materials', async (req, res) => {
     try {
         const material = new Material(req.body);
@@ -510,7 +559,7 @@ app.get('/api/materials/year/:year', async (req, res) => {
         const { department } = req.query;
         let query = { year: req.params.year };
         if (department) query.department = department;
-        
+
         const materials = await Material.find(query);
         res.json({ success: true, data: materials });
     } catch (error) {
@@ -527,87 +576,125 @@ app.get('/api/materials', async (req, res) => {
     }
 });
 
-// File download endpoint - now checks all content types
+// -------------------------
+// File download endpoint
+// Streams from GridFS when fileId exists, otherwise falls back to local file only if filePath points to a real file
+// -------------------------
 app.get('/api/files/download/:id', async (req, res) => {
     try {
         let content = null;
-        
-        // Try to find the file in materials, questions, or updates
+
         content = await Material.findById(req.params.id);
-        if (!content) {
-            content = await Question.findById(req.params.id);
-        }
-        if (!content) {
-            content = await Update.findById(req.params.id);
-        }
-        
+        if (!content) content = await Question.findById(req.params.id);
+        if (!content) content = await Update.findById(req.params.id);
+
         if (!content) {
             return res.status(404).json({ success: false, message: 'File not found' });
         }
 
-        if (!content.fileName) {
-            return res.status(404).json({ success: false, message: 'No file attached to this content' });
+        // If stored in GridFS
+        if (content.fileId) {
+            if (!gfsBucket) {
+                return res.status(500).json({ success: false, message: 'GridFS bucket not initialized' });
+            }
+
+            const fileObjectId = typeof content.fileId === 'string' ? new ObjectId(content.fileId) : content.fileId;
+
+            res.setHeader('Content-Type', content.fileType || 'application/octet-stream');
+            res.setHeader('Content-Disposition', `attachment; filename="${content.originalFileName || content.fileName || 'file'}"`);
+
+            const downloadStream = gfsBucket.openDownloadStream(fileObjectId);
+            downloadStream.on('error', (err) => {
+                console.error('GridFS download error:', err);
+                return res.status(404).json({ success: false, message: 'File not found on server' });
+            });
+            downloadStream.pipe(res);
+            return;
         }
 
-        const filePath = content.filePath || path.join(uploadsDir, content.fileName);
-        
-        if (!fs.existsSync(filePath)) {
-            return res.status(404).json({ success: false, message: 'File not found on server' });
+        // Fallback to local filesystem only if a valid filePath exists and is a file
+        if (content.filePath && typeof content.filePath === 'string' && fs.existsSync(content.filePath)) {
+            const stats = fs.statSync(content.filePath);
+            if (stats.isFile()) {
+                return res.download(content.filePath, content.originalFileName || content.fileName);
+            }
         }
 
-        res.download(filePath, content.originalFileName || content.fileName);
+        return res.status(404).json({ success: false, message: 'File not found on server' });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// File view endpoint - now checks all content types
+// -------------------------
+// File view endpoint
+// Streams inline from GridFS when fileId exists; fallback similar to download
+// -------------------------
 app.get('/api/files/view/:id', async (req, res) => {
     try {
         let content = null;
-        
-        // Try to find the file in materials, questions, or updates
+
         content = await Material.findById(req.params.id);
-        if (!content) {
-            content = await Question.findById(req.params.id);
-        }
-        if (!content) {
-            content = await Update.findById(req.params.id);
-        }
-        
+        if (!content) content = await Question.findById(req.params.id);
+        if (!content) content = await Update.findById(req.params.id);
+
         if (!content) {
             return res.status(404).json({ success: false, message: 'File not found' });
         }
 
-        if (!content.fileName) {
-            return res.status(404).json({ success: false, message: 'No file attached to this content' });
+        if (content.fileId) {
+            if (!gfsBucket) {
+                return res.status(500).json({ success: false, message: 'GridFS bucket not initialized' });
+            }
+
+            const fileObjectId = typeof content.fileId === 'string' ? new ObjectId(content.fileId) : content.fileId;
+
+            res.setHeader('Content-Type', content.fileType || 'application/octet-stream');
+            res.setHeader('Content-Disposition', `inline; filename="${content.originalFileName || content.fileName || 'file'}"`);
+
+            const downloadStream = gfsBucket.openDownloadStream(fileObjectId);
+            downloadStream.on('error', (err) => {
+                console.error('GridFS view error:', err);
+                return res.status(404).json({ success: false, message: 'File not found on server' });
+            });
+            downloadStream.pipe(res);
+            return;
         }
 
-        const filePath = content.filePath || path.join(uploadsDir, content.fileName);
-        
-        if (!fs.existsSync(filePath)) {
-            return res.status(404).json({ success: false, message: 'File not found on server' });
+        // fallback to local file only if actual file exists
+        if (content.filePath && typeof content.filePath === 'string' && fs.existsSync(content.filePath)) {
+            const stats = fs.statSync(content.filePath);
+            if (stats.isFile()) {
+                res.setHeader('Content-Type', content.fileType || 'application/octet-stream');
+                res.setHeader('Content-Disposition', `inline; filename="${content.originalFileName || content.fileName}"`);
+                const fileStream = fs.createReadStream(content.filePath);
+                fileStream.pipe(res);
+                return;
+            }
         }
 
-        // Set appropriate content type
-        res.setHeader('Content-Type', content.fileType || 'application/octet-stream');
-        res.setHeader('Content-Disposition', `inline; filename="${content.originalFileName || content.fileName}"`);
-        
-        const fileStream = fs.createReadStream(filePath);
-        fileStream.pipe(res);
+        return res.status(404).json({ success: false, message: 'File not found on server' });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// Question Routes
+// -------------------------
+// Question Routes (GridFS)
+// -------------------------
 app.post('/api/questions/upload', upload.single('file'), async (req, res) => {
     try {
         const { title, description, year, department, createdBy } = req.body;
-        
+
         if (!req.file) {
             return res.status(400).json({ success: false, message: 'No file uploaded' });
         }
+
+        const gridFileId = req.file.id || req.file._id || (req.file.fileId ? req.file.fileId : null);
+        const gridFilename = req.file.filename;
+        const originalFileName = (req.file.metadata && req.file.metadata.originalname) || req.file.originalname || gridFilename;
+        const fileType = req.file.contentType || req.file.mimetype || 'application/octet-stream';
+        const fileSize = req.file.size || 0;
 
         const question = new Question({
             title,
@@ -615,11 +702,12 @@ app.post('/api/questions/upload', upload.single('file'), async (req, res) => {
             year,
             department,
             createdBy,
-            fileName: req.file.filename,
-            originalFileName: req.file.originalname,
-            filePath: req.file.path,
-            fileSize: req.file.size,
-            fileType: req.file.mimetype
+            fileName: gridFilename,
+            originalFileName,
+            filePath: null,
+            fileSize,
+            fileType,
+            fileId: gridFileId
         });
 
         await question.save();
@@ -644,7 +732,7 @@ app.get('/api/questions/year/:year', async (req, res) => {
         const { department } = req.query;
         let query = { year: req.params.year };
         if (department) query.department = department;
-        
+
         const questions = await Question.find(query);
         res.json({ success: true, data: questions });
     } catch (error) {
@@ -652,14 +740,22 @@ app.get('/api/questions/year/:year', async (req, res) => {
     }
 });
 
-// Update upload endpoint for updates with files
+// -------------------------
+// Update upload endpoint (GridFS)
+// -------------------------
 app.post('/api/updates/upload', upload.single('file'), async (req, res) => {
     try {
         const { title, description, year, department, createdBy } = req.body;
-        
+
         if (!req.file) {
             return res.status(400).json({ success: false, message: 'No file uploaded' });
         }
+
+        const gridFileId = req.file.id || req.file._id || (req.file.fileId ? req.file.fileId : null);
+        const gridFilename = req.file.filename;
+        const originalFileName = (req.file.metadata && req.file.metadata.originalname) || req.file.originalname || gridFilename;
+        const fileType = req.file.contentType || req.file.mimetype || 'application/octet-stream';
+        const fileSize = req.file.size || 0;
 
         const update = new Update({
             title,
@@ -667,11 +763,12 @@ app.post('/api/updates/upload', upload.single('file'), async (req, res) => {
             year,
             department,
             createdBy,
-            fileName: req.file.filename,
-            originalFileName: req.file.originalname,
-            filePath: req.file.path,
-            fileSize: req.file.size,
-            fileType: req.file.mimetype
+            fileName: gridFilename,
+            originalFileName,
+            filePath: null,
+            fileSize,
+            fileType,
+            fileId: gridFileId
         });
 
         await update.save();
@@ -681,7 +778,6 @@ app.post('/api/updates/upload', upload.single('file'), async (req, res) => {
     }
 });
 
-// Update Routes
 app.post('/api/updates', async (req, res) => {
     try {
         const update = new Update(req.body);
@@ -697,7 +793,7 @@ app.get('/api/updates/year/:year', async (req, res) => {
         const { department } = req.query;
         let query = { year: req.params.year };
         if (department) query.department = department;
-        
+
         const updates = await Update.find(query);
         res.json({ success: true, data: updates });
     } catch (error) {
@@ -714,18 +810,20 @@ app.get('/api/updates', async (req, res) => {
     }
 });
 
-// Attendance Routes
+// -------------------------
+// Attendance Routes (unchanged)
+// -------------------------
 app.post('/api/attendance', async (req, res) => {
     try {
         const { records } = req.body;
         const results = [];
-        
+
         for (const record of records) {
             const attendance = new Attendance(record);
             await attendance.save();
             results.push(attendance);
         }
-        
+
         res.json({ success: true, data: results });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
@@ -741,23 +839,21 @@ app.get('/api/attendance/student/:studentId', async (req, res) => {
     }
 });
 
-// Get attendance by department with filters
 app.get('/api/attendance/department', async (req, res) => {
     try {
         const { year, department, date, period } = req.query;
         let query = {};
-        
+
         if (year) query.year = year;
         if (department) query.department = department;
         if (date) {
-            // Create date range for the entire day
             const startDate = new Date(date);
             const endDate = new Date(date);
             endDate.setDate(endDate.getDate() + 1);
             query.date = { $gte: startDate, $lt: endDate };
         }
         if (period) query.period = period;
-        
+
         const attendance = await Attendance.find(query).sort({ date: -1, studentName: 1 });
         res.json({ success: true, data: attendance });
     } catch (error) {
@@ -765,20 +861,22 @@ app.get('/api/attendance/department', async (req, res) => {
     }
 });
 
-// SMS Routes
+// -------------------------
+// SMS Routes (unchanged)
+// -------------------------
 app.post('/api/sms/send', async (req, res) => {
     try {
         const { recipients, message, sentBy, type } = req.body;
-        
+
         console.log('📱 SMS Send Request:', {
             recipients: recipients.length,
             sentBy,
             type,
             timestamp: new Date()
         });
-        
-        res.json({ 
-            success: true, 
+
+        res.json({
+            success: true,
             message: 'SMS logged successfully',
             count: recipients.length
         });
@@ -787,7 +885,24 @@ app.post('/api/sms/send', async (req, res) => {
     }
 });
 
+// -------------------------
 // Delete content routes
+// Delete GridFS file if fileId exists, otherwise delete local file if present
+// -------------------------
+async function deleteGridFSFileById(fileObjectId) {
+    if (!fileObjectId) return;
+    if (!gfsBucket) {
+        console.warn('GridFS bucket not initialized; cannot delete file.');
+        return;
+    }
+    try {
+        const id = typeof fileObjectId === 'string' ? new ObjectId(fileObjectId) : fileObjectId;
+        await gfsBucket.delete(id);
+    } catch (err) {
+        console.warn('GridFS delete warning:', err && err.message);
+    }
+}
+
 app.delete('/api/materials/:id', async (req, res) => {
     try {
         const material = await Material.findById(req.params.id);
@@ -795,9 +910,10 @@ app.delete('/api/materials/:id', async (req, res) => {
             return res.status(404).json({ success: false, message: 'Material not found' });
         }
 
-        // Delete file from filesystem
-        if (material.filePath && fs.existsSync(material.filePath)) {
-            fs.unlinkSync(material.filePath);
+        if (material.fileId) {
+            await deleteGridFSFileById(material.fileId);
+        } else if (material.filePath && fs.existsSync(material.filePath)) {
+            try { fs.unlinkSync(material.filePath); } catch(e){/* ignore */ }
         }
 
         await Material.findByIdAndDelete(req.params.id);
@@ -814,9 +930,10 @@ app.delete('/api/questions/:id', async (req, res) => {
             return res.status(404).json({ success: false, message: 'Question not found' });
         }
 
-        // Delete file from filesystem
-        if (question.filePath && fs.existsSync(question.filePath)) {
-            fs.unlinkSync(question.filePath);
+        if (question.fileId) {
+            await deleteGridFSFileById(question.fileId);
+        } else if (question.filePath && fs.existsSync(question.filePath)) {
+            try { fs.unlinkSync(question.filePath); } catch(e){/* ignore */ }
         }
 
         await Question.findByIdAndDelete(req.params.id);
@@ -833,9 +950,10 @@ app.delete('/api/updates/:id', async (req, res) => {
             return res.status(404).json({ success: false, message: 'Update not found' });
         }
 
-        // Delete file from filesystem
-        if (update.filePath && fs.existsSync(update.filePath)) {
-            fs.unlinkSync(update.filePath);
+        if (update.fileId) {
+            await deleteGridFSFileById(update.fileId);
+        } else if (update.filePath && fs.existsSync(update.filePath)) {
+            try { fs.unlinkSync(update.filePath); } catch(e){/* ignore */ }
         }
 
         await Update.findByIdAndDelete(req.params.id);
@@ -845,21 +963,17 @@ app.delete('/api/updates/:id', async (req, res) => {
     }
 });
 
+// -------------------------
 // Start server
+// -------------------------
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
     console.log(`✅ Server running on http://localhost:${PORT}`);
     console.log('📊 MongoDB connecting to student_portal database...');
     console.log('🚀 Student Portal API Ready');
-    console.log('📁 File uploads enabled - uploads/ directory');
+    console.log('📁 File uploads handled by GridFS (uploads bucket)');
     console.log('🔗 Health check: http://localhost:5000/api/health');
     console.log('📥 File download endpoint: /api/files/download/:id');
     console.log('👁️  File view endpoint: /api/files/view/:id');
     console.log('📤 Update upload endpoint: /api/updates/upload');
-    console.log('👤 Admin management enabled');
-    console.log('📅 Enhanced attendance with date/period support');
-    console.log('🔍 Department-wise student and attendance viewing enabled');
-    console.log('🗑️  Delete functionality for students, faculty, and admins enabled');
-    console.log('🆔 Individual delete by ID functionality added');
-    console.log('🔧 FIXED: Separate faculty and admin department filters');
 });
